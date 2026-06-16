@@ -304,7 +304,8 @@ if __name__ == "__main__":
     )
     t_udp.start()
 
-    device_path = _find_mouse_event_device()
+    device_path = "/dev/input/event1"
+    print("Using:", device_path)
 
     t_mouse = threading.Thread(
         target=_evdev_thread,
