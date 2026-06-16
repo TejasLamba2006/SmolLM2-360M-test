@@ -7,7 +7,6 @@ import threading
 import time
 from collections import deque
 from flask import Flask, jsonify, send_from_directory
-from pynput import mouse
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 COUNTS_PER_CM = 151
@@ -21,8 +20,15 @@ INPUT_EVENT_FMT = "llHHi"
 INPUT_EVENT_SIZE = struct.calcsize(INPUT_EVENT_FMT)
 
 # /linux/input-event-codes.h
-EV_SYN, EV_REL = 0x00, 0x02
-REL_X,  REL_Y = 0x00, 0x01
+EV_SYN = 0x00
+EV_KEY = 0x01
+EV_REL = 0x02
+
+REL_X = 0x00
+REL_Y = 0x01
+
+BTN_LEFT = 272
+BTN_RIGHT = 273
 
 app = Flask(__name__, static_folder=".")
 
@@ -130,29 +136,51 @@ def _find_mouse_event_device() -> str:
 
 
 def _raw_input_delta_callback(raw_dx: int, raw_dy: int):
-    """Shared odometry update — identical logic to the Windows version."""
-    global _ema_distance
+    """
+    Convert mouse movement from robot frame to world frame.
+    """
 
-    raw_counts = -raw_dy   # push forward = positive distance
-    _raw_dx_buf.append(raw_counts)
-    smoothed_counts = sum(_raw_dx_buf) / len(_raw_dx_buf)
-
-    _ema_distance = (1 - EMA_ALPHA) * _ema_distance + \
-        EMA_ALPHA * smoothed_counts
-    dist_cm = _ema_distance / COUNTS_PER_CM
+    local_x_cm = raw_dx / COUNTS_PER_CM
+    local_y_cm = -raw_dy / COUNTS_PER_CM
 
     with lock:
-        if state["recording"]:
-            yaw_rad = math.radians(state["yaw"])
-            state["x"] += dist_cm * math.cos(yaw_rad)
-            state["y"] += dist_cm * math.sin(yaw_rad)
-            state["distance"] += dist_cm
-            path = state["path"]
-            if not path or math.hypot(
+
+        if not state["recording"]:
+            return
+
+        yaw_rad = math.radians(state["yaw"])
+
+        world_dx = (
+            local_x_cm * math.cos(yaw_rad)
+            - local_y_cm * math.sin(yaw_rad)
+        )
+
+        world_dy = (
+            local_x_cm * math.sin(yaw_rad)
+            + local_y_cm * math.cos(yaw_rad)
+        )
+
+        state["x"] += world_dx
+        state["y"] += world_dy
+
+        state["distance"] += math.sqrt(
+            local_x_cm * local_x_cm +
+            local_y_cm * local_y_cm
+        )
+
+        path = state["path"]
+
+        if (
+            not path
+            or math.hypot(
                 state["x"] - path[-1][0],
                 state["y"] - path[-1][1]
-            ) > 0.5:
-                path.append([round(state["x"], 2), round(state["y"], 2)])
+            ) > 0.5
+        ):
+            path.append([
+                round(state["x"], 2),
+                round(state["y"], 2)
+            ])
 
 
 def _evdev_thread(device_path: str):
@@ -177,7 +205,7 @@ def _evdev_thread(device_path: str):
 
     pending_dx = 0
     pending_dy = 0
-
+    global _click_count, _last_click
     while True:
         try:
             raw = fd.read(INPUT_EVENT_SIZE)
@@ -195,7 +223,46 @@ def _evdev_thread(device_path: str):
                     pending_dx += ev_value
                 elif ev_code == REL_Y:
                     pending_dy += ev_value
+            elif ev_type == EV_KEY:
 
+                if ev_code == BTN_LEFT:
+
+                    now = time.time()
+
+                    if ev_value == 1:
+
+                        if now - _last_click < 0.4:
+                            _click_count += 1
+                        else:
+                            _click_count = 1
+
+                        _last_click = now
+
+                        if _click_count >= 2:
+
+                            _click_count = 0
+
+                            with lock:
+                                state["x"] = 0.0
+                                state["y"] = 0.0
+                                state["distance"] = 0.0
+                                state["recording"] = False
+                                state["path"] = [[0.0, 0.0]]
+
+                            print("[Mouse] MAP RESET")
+                            continue
+
+                        with lock:
+                            state["recording"] = True
+
+                        print("[Mouse] RECORDING STARTED")
+
+                    elif ev_value == 0:
+
+                        with lock:
+                            state["recording"] = False
+
+                        print("[Mouse] RECORDING STOPPED")
             elif ev_type == EV_SYN:
                 # SYN_REPORT (code 0) marks end of one logical event frame
                 if (pending_dx != 0 or pending_dy != 0):
@@ -207,53 +274,6 @@ def _evdev_thread(device_path: str):
             print(f"[evdev] Error: {e}")
             time.sleep(0.1)
 
-
-# ── Mouse click listener (pynput — start / stop / reset) ─────────────────────
-def start_mouse_listener():
-    device_path = _find_mouse_event_device()
-
-    # evdev thread handles movement deltas
-    t = threading.Thread(target=_evdev_thread,
-                         args=(device_path,), daemon=True)
-    t.start()
-
-    # pynput handles clicks only
-    def on_click(x, y, button, pressed):
-        global _click_count, _last_click
-        if button != mouse.Button.left:
-            return
-
-        now = time.time()
-        if pressed:
-            if now - _last_click < 0.4:
-                _click_count += 1
-            else:
-                _click_count = 1
-            _last_click = now
-
-            if _click_count >= 2:
-                _click_count = 0
-                with lock:
-                    state["x"] = 0.0
-                    state["y"] = 0.0
-                    state["distance"] = 0.0
-                    state["recording"] = False
-                    state["path"] = [[0.0, 0.0]]
-                print("[Mouse] Map reset")
-                return
-
-            with lock:
-                state["recording"] = True
-            print("[Mouse] Recording started")
-        else:
-            with lock:
-                state["recording"] = False
-            print("[Mouse] Recording stopped")
-
-    listener = mouse.Listener(on_click=on_click, suppress=False)
-    listener.daemon = True
-    listener.start()
-    print("[Mouse] Click listener started")
 
 # ── Flask Routes ──────────────────────────────────────────────────────────────
 
@@ -278,10 +298,25 @@ def get_state():
 
 # ── Entry Point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    t_udp = threading.Thread(target=udp_listener, daemon=True)
+    t_udp = threading.Thread(
+        target=udp_listener,
+        daemon=True
+    )
     t_udp.start()
 
-    start_mouse_listener()
+    device_path = _find_mouse_event_device()
 
-    app.run(host="0.0.0.0", port=5000, debug=False,
-            use_reloader=False, threaded=True)
+    t_mouse = threading.Thread(
+        target=_evdev_thread,
+        args=(device_path,),
+        daemon=True
+    )
+    t_mouse.start()
+
+    app.run(
+        host="0.0.0.0",
+        port=5000,
+        debug=False,
+        use_reloader=False,
+        threaded=True
+    )
