@@ -98,42 +98,6 @@ def udp_listener():
         except Exception as e:
             print(f"[UDP] Error: {e}")
 
-# ── Linux evdev mouse reader ──────────────────────────────────────────────────
-
-
-def _find_mouse_event_device() -> str:
-    """
-    Scan /proc/bus/input/devices and return the /dev/input/eventX path
-    for the first device that reports EV_REL (relative axes = mouse).
-    Falls back to /dev/input/mice if nothing is found.
-    """
-    try:
-        with open("/proc/bus/input/devices") as f:
-            content = f.read()
-
-        # Each device block is separated by a blank line
-        for block in content.split("\n\n"):
-            # Handlers line looks like:  H: Handlers=mouse0 event3 ...
-            # Bitmap line looks like:    B: EV=17  (bit 1 = EV_KEY, bit 2 = EV_REL)
-            has_rel = False
-            event_node = None
-            for line in block.splitlines():
-                if line.startswith("B: EV="):
-                    ev_bits = int(line.split("=")[1], 16)
-                    has_rel = bool(ev_bits & (1 << EV_REL))   # bit 2
-                if line.startswith("H: Handlers="):
-                    for token in line.split():
-                        if token.startswith("event"):
-                            event_node = f"/dev/input/{token}"
-            if has_rel and event_node:
-                print(f"[evdev] Auto-detected mouse: {event_node}")
-                return event_node
-    except Exception as e:
-        print(f"[evdev] Device scan failed: {e}")
-
-    print("[evdev] Falling back to /dev/input/mice")
-    return "/dev/input/mice"
-
 
 def _raw_input_delta_callback(raw_dx: int, raw_dy: int):
     """
@@ -148,7 +112,7 @@ def _raw_input_delta_callback(raw_dx: int, raw_dy: int):
         if not state["recording"]:
             return
 
-        yaw_rad = math.radians(state["yaw"])
+        yaw_rad = math.radians(state["yaw"] - 90)
 
         world_dx = (
             local_x_cm * math.cos(yaw_rad)
